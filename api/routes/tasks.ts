@@ -109,9 +109,21 @@ router.get('/', (_req: Request, res: Response) => {
         status: task.status,
         progress: task.progress,
         error: task.error,
+        retryCount: task.retryCount,
+        maxRetries: task.maxRetries,
         createdAt: task.createdAt,
-        fileCount: task.files.length,
-        resultCount: task.resultFiles?.length || 0,
+        startedAt: task.startedAt,
+        completedAt: task.completedAt,
+        files: task.files.map((f) => ({
+          id: f.id,
+          name: f.name,
+          size: f.size,
+        })),
+        resultFiles: task.resultFiles?.map((f) => ({
+          id: f.id,
+          name: f.name,
+          size: f.size,
+        })),
       })),
     });
   } catch (error) {

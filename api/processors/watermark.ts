@@ -1,9 +1,11 @@
 import fs from 'fs-extra';
 import path from 'path';
 import { PDFDocument, StandardFonts, rgb, degrees } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
 import type { Task, FileInfo, WatermarkOptions } from '../types.js';
 import { config } from '../config.js';
 import { generateId, sanitizeFilename } from '../utils/fileUtils.js';
+import { containsCJK, loadCJKFontBytes } from '../utils/fontLoader.js';
 
 type TaskQueueType = {
   updateProgress: (taskId: string, progress: number) => void;
@@ -48,6 +50,8 @@ export async function addTextWatermark(task: Task, taskQueue: TaskQueueType): Pr
   const density = opts.density ?? 1;
   const color = parseColor(opts.color);
 
+  const useCJK = containsCJK(text);
+
   const totalFiles = task.files.length;
   let fileProcessed = 0;
 
@@ -56,7 +60,15 @@ export async function addTextWatermark(task: Task, taskQueue: TaskQueueType): Pr
 
     const pdfBytes = await fs.readFile(file.path);
     const pdfDoc = await PDFDocument.load(pdfBytes);
-    const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    pdfDoc.registerFontkit(fontkit);
+
+    let font: Awaited<ReturnType<typeof pdfDoc.embedFont>>;
+    if (useCJK) {
+      const fontBytes = await loadCJKFontBytes();
+      font = await pdfDoc.embedFont(fontBytes);
+    } else {
+      font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    }
 
     const pages = pdfDoc.getPages();
     const totalPages = pages.length;
@@ -68,7 +80,8 @@ export async function addTextWatermark(task: Task, taskQueue: TaskQueueType): Pr
       const { width, height } = page.getSize();
 
       if (position === 'tile') {
-        const xGap = (size * text.length) / density + 50;
+        const textWidth = font.widthOfTextAtSize(text, size);
+        const xGap = textWidth / density + 50;
         const yGap = (size * 3) / density;
 
         for (let y = -height / 2; y < height * 1.5; y += yGap) {
@@ -77,7 +90,7 @@ export async function addTextWatermark(task: Task, taskQueue: TaskQueueType): Pr
               x,
               y,
               size,
-              font: helveticaFont,
+              font,
               color: rgb(color.r, color.g, color.b),
               opacity,
               rotate: degrees(angle),
@@ -88,7 +101,7 @@ export async function addTextWatermark(task: Task, taskQueue: TaskQueueType): Pr
         let x = width / 2;
         let y = height / 2;
 
-        const textWidth = helveticaFont.widthOfTextAtSize(text, size);
+        const textWidth = font.widthOfTextAtSize(text, size);
         const textHeight = size;
 
         switch (position) {
@@ -118,7 +131,7 @@ export async function addTextWatermark(task: Task, taskQueue: TaskQueueType): Pr
           x,
           y,
           size,
-          font: helveticaFont,
+          font,
           color: rgb(color.r, color.g, color.b),
           opacity,
           rotate: degrees(position === 'center' ? angle : 0),

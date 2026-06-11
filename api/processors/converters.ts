@@ -2,13 +2,17 @@ import fs from 'fs-extra';
 import path from 'path';
 import { createRequire } from 'module';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
 import sharp from 'sharp';
+import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { createCanvas } from '@napi-rs/canvas';
 import type { Task, FileInfo } from '../types.js';
 
 const require = createRequire(import.meta.url);
 const pdfParseFn = require('pdf-parse') as (data: Buffer) => Promise<{ text: string }>;
 import { config } from '../config.js';
 import { generateId, sanitizeFilename, getFileExtension } from '../utils/fileUtils.js';
+import { containsCJK, loadCJKFontBytes } from '../utils/fontLoader.js';
 
 type TaskQueueType = {
   updateProgress: (taskId: string, progress: number) => void;
@@ -68,14 +72,26 @@ export async function txtToPdf(task: Task, taskQueue: TaskQueueType): Promise<Fi
 
     const text = await fs.readFile(file.path, 'utf-8');
     const pdfDoc = await PDFDocument.create();
-    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    pdfDoc.registerFontkit(fontkit);
+
+    const useCJK = containsCJK(text);
+    let font: Awaited<ReturnType<typeof pdfDoc.embedFont>>;
+    let charsPerLine: number;
+
+    if (useCJK) {
+      const fontBytes = await loadCJKFontBytes();
+      font = await pdfDoc.embedFont(fontBytes);
+      charsPerLine = Math.floor((595 - 100) / 12);
+    } else {
+      font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+      charsPerLine = Math.floor((595 - 100) / (12 * 0.6));
+    }
 
     const pageWidth = 595;
     const pageHeight = 842;
     const margin = 50;
     const fontSize = 12;
     const lineHeight = fontSize * 1.5;
-    const charsPerLine = Math.floor((pageWidth - margin * 2) / (fontSize * 0.6));
 
     const lines: string[] = [];
     const paragraphs = text.split('\n');
@@ -87,11 +103,21 @@ export async function txtToPdf(task: Task, taskQueue: TaskQueueType): Promise<Fi
       }
       let currentLine = '';
       for (const char of paragraph) {
-        if (currentLine.length >= charsPerLine) {
-          lines.push(currentLine);
-          currentLine = char;
+        if (useCJK) {
+          const testWidth = font.widthOfTextAtSize(currentLine + char, fontSize);
+          if (testWidth > pageWidth - margin * 2) {
+            lines.push(currentLine);
+            currentLine = char;
+          } else {
+            currentLine += char;
+          }
         } else {
-          currentLine += char;
+          if (currentLine.length >= charsPerLine) {
+            lines.push(currentLine);
+            currentLine = char;
+          } else {
+            currentLine += char;
+          }
         }
       }
       if (currentLine) {
@@ -286,6 +312,8 @@ export async function pdfToImages(task: Task, taskQueue: TaskQueueType): Promise
   const options = task.options as { format?: string; quality?: number; dpi?: number };
   const format = (options.format || 'png') as 'png' | 'jpeg';
   const quality = options.quality || 80;
+  const dpi = options.dpi || 150;
+  const scale = dpi / 72;
 
   const totalFiles = task.files.length;
   let fileProcessed = 0;
@@ -293,36 +321,37 @@ export async function pdfToImages(task: Task, taskQueue: TaskQueueType): Promise
   for (const file of task.files) {
     checkCancelledOrPaused(task.id, taskQueue);
 
-    const pdfBytes = await fs.readFile(file.path);
-    const pdfDoc = await PDFDocument.load(pdfBytes);
-    const totalPages = pdfDoc.getPageCount();
+    const dataBuffer = await fs.readFile(file.path);
+    const data = new Uint8Array(dataBuffer);
 
-    for (let i = 0; i < totalPages; i++) {
+    const doc = await getDocument({ data }).promise;
+    const totalPages = doc.numPages;
+
+    for (let i = 1; i <= totalPages; i++) {
       checkCancelledOrPaused(task.id, taskQueue);
 
-      const page = pdfDoc.getPage(i);
-      const { width, height } = page.getSize();
+      const page = await doc.getPage(i);
+      const viewport = page.getViewport({ scale });
 
-      const newPdf = await PDFDocument.create();
-      const [copiedPage] = await newPdf.copyPages(pdfDoc, [i]);
-      newPdf.addPage(copiedPage);
-      const singlePageBytes = await newPdf.save();
+      const canvas = createCanvas(Math.floor(viewport.width), Math.floor(viewport.height));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const context = canvas.getContext('2d') as any;
 
-      const pngBuffer = Buffer.from(singlePageBytes);
+      await page.render({
+        canvas: null,
+        canvasContext: context,
+        viewport,
+      }).promise;
 
       let imageBuffer: Buffer;
       if (format === 'jpeg') {
-        imageBuffer = await sharp(pngBuffer)
-          .jpeg({ quality })
-          .toBuffer();
+        imageBuffer = canvas.toBuffer('image/jpeg', quality / 100);
       } else {
-        imageBuffer = await sharp(pngBuffer)
-          .png()
-          .toBuffer();
+        imageBuffer = canvas.toBuffer('image/png');
       }
 
       const ext = format === 'jpeg' ? 'jpg' : 'png';
-      const fileName = `${sanitizeFilename(file.originalName.replace('.pdf', ''))}_第${i + 1}页.${ext}`;
+      const fileName = `${sanitizeFilename(file.originalName.replace('.pdf', ''))}_第${i}页.${ext}`;
       const resultPath = path.join(config.paths.results, `${generateId()}.${ext}`);
       await fs.writeFile(resultPath, imageBuffer);
 
@@ -337,10 +366,11 @@ export async function pdfToImages(task: Task, taskQueue: TaskQueueType): Promise
       });
 
       const overallProgress =
-        ((fileProcessed + (i + 1) / totalPages) / totalFiles) * 100;
+        ((fileProcessed + i / totalPages) / totalFiles) * 100;
       taskQueue.updateProgress(task.id, overallProgress);
     }
 
+    doc.destroy();
     fileProcessed++;
   }
 
@@ -460,14 +490,23 @@ export async function wordToPdf(task: Task, taskQueue: TaskQueueType): Promise<F
       const text = await extractTextFromDocx(fileBuffer);
 
       const pdfDoc = await PDFDocument.create();
-      const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+      pdfDoc.registerFontkit(fontkit);
+
+      const useCJK = containsCJK(text);
+      let font: Awaited<ReturnType<typeof pdfDoc.embedFont>>;
+
+      if (useCJK) {
+        const fontBytes = await loadCJKFontBytes();
+        font = await pdfDoc.embedFont(fontBytes);
+      } else {
+        font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+      }
 
       const pageWidth = 595;
       const pageHeight = 842;
       const margin = 50;
       const fontSize = 12;
       const lineHeight = fontSize * 1.5;
-      const charsPerLine = Math.floor((pageWidth - margin * 2) / (fontSize * 0.6));
 
       const lines: string[] = [];
       const paragraphs = text.split('\n');
@@ -479,11 +518,21 @@ export async function wordToPdf(task: Task, taskQueue: TaskQueueType): Promise<F
         }
         let currentLine = '';
         for (const char of paragraph) {
-          if (currentLine.length >= charsPerLine) {
-            lines.push(currentLine);
-            currentLine = char;
+          if (useCJK) {
+            const testWidth = font.widthOfTextAtSize(currentLine + char, fontSize);
+            if (testWidth > pageWidth - margin * 2) {
+              lines.push(currentLine);
+              currentLine = char;
+            } else {
+              currentLine += char;
+            }
           } else {
-            currentLine += char;
+            if (currentLine.length >= Math.floor((pageWidth - margin * 2) / (fontSize * 0.6))) {
+              lines.push(currentLine);
+              currentLine = char;
+            } else {
+              currentLine += char;
+            }
           }
         }
         if (currentLine) {
