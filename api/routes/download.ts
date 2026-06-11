@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { getResultFilePath, createZipPackage } from '../services/downloadService.js';
 import { taskQueue } from '../services/taskQueue.js';
+import type { FileInfo } from '../types.js';
 
 const router = Router();
 
@@ -71,6 +72,62 @@ router.post('/task/:taskId/zip', async (req: Request, res: Response) => {
         name: zipFile.name,
         size: zipFile.size,
       },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.get('/all-completed/download', async (req: Request, res: Response) => {
+  try {
+    const allTasks = taskQueue.getAllTasks();
+    const completedTasks = allTasks.filter(
+      (task) => task.status === 'completed' && task.resultFiles && task.resultFiles.length > 0
+    );
+
+    if (completedTasks.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: '没有已完成的任务',
+      });
+      return;
+    }
+
+    const allFiles: FileInfo[] = [];
+    const taskNameMap = new Map<string, number>();
+
+    for (const task of completedTasks) {
+      const taskLabel = task.type;
+      const count = taskNameMap.get(taskLabel) || 0;
+      taskNameMap.set(taskLabel, count + 1);
+
+      for (const file of task.resultFiles!) {
+        const taskDirName = count > 0 ? `${taskLabel}_${count + 1}` : taskLabel;
+        allFiles.push({
+          ...file,
+          originalName: `${taskDirName}/${file.originalName || file.name}`,
+        });
+      }
+    }
+
+    const zipFile = await createZipPackage(
+      allFiles,
+      `全部任务结果_${Date.now()}.zip`
+    );
+
+    res.download(zipFile.path, zipFile.name, (err) => {
+      if (err) {
+        console.error('下载失败:', err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            success: false,
+            error: '下载失败',
+          });
+        }
+      }
     });
   } catch (error) {
     res.status(500).json({

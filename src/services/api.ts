@@ -151,6 +151,10 @@ export const downloadApi = {
     return `${API_BASE}/download/task/${taskId}/download`;
   },
 
+  getAllCompletedDownloadUrl(): string {
+    return `${API_BASE}/download/all-completed/download`;
+  },
+
   async createTaskZip(taskId: string): Promise<{ fileId: string; name: string; size: number }> {
     return request<{ fileId: string; name: string; size: number }>(
       `/download/task/${taskId}/zip`,

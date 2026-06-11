@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   Play,
   Pause,
@@ -12,11 +12,12 @@ import {
   Loader2,
   PauseCircle,
   RefreshCw,
+  Archive,
 } from 'lucide-react';
 import { useAppStore } from '../store/appStore';
 import { TASK_TYPE_LABELS, STATUS_LABELS, STATUS_COLORS } from '../types';
 import type { Task } from '../types';
-import { formatFileSize, formatDate } from '../utils/format';
+import { formatFileSize, formatDate, formatDuration } from '../utils/format';
 import { taskApi, downloadApi } from '../services/api';
 
 const getStatusIcon = (status: Task['status']) => {
@@ -44,7 +45,36 @@ interface TaskItemProps {
 
 const TaskItem: React.FC<TaskItemProps> = ({ task }) => {
   const [isLoading, setIsLoading] = useState(false);
+  const [elapsedTime, setElapsedTime] = useState<number | null>(null);
   const { updateTask } = useAppStore();
+  const intervalRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const updateElapsed = () => {
+      if (task.status === 'processing' && task.startedAt) {
+        setElapsedTime(Date.now() - task.startedAt);
+      } else if (task.status === 'completed' && task.startedAt && task.completedAt) {
+        setElapsedTime(task.completedAt - task.startedAt);
+      } else if (task.status === 'failed' && task.startedAt && task.completedAt) {
+        setElapsedTime(task.completedAt - task.startedAt);
+      } else {
+        setElapsedTime(null);
+      }
+    };
+
+    updateElapsed();
+
+    if (task.status === 'processing') {
+      intervalRef.current = window.setInterval(updateElapsed, 1000);
+    }
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [task.status, task.startedAt, task.completedAt]);
 
   const handlePause = async () => {
     setIsLoading(true);
@@ -115,21 +145,27 @@ const TaskItem: React.FC<TaskItemProps> = ({ task }) => {
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between mb-2">
-            <div className="flex items-center gap-2">
-              <span className="font-medium text-gray-800">
-                {TASK_TYPE_LABELS[task.type] || task.type}
-              </span>
-              <span
-                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium text-white ${STATUS_COLORS[task.status]}`}
-              >
-                {getStatusIcon(task.status)}
-                {STATUS_LABELS[task.status]}
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-gray-800">
+                  {TASK_TYPE_LABELS[task.type] || task.type}
+                </span>
+                <span
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium text-white ${STATUS_COLORS[task.status]}`}
+                >
+                  {getStatusIcon(task.status)}
+                  {STATUS_LABELS[task.status]}
+                </span>
+              </div>
+              <div className="flex items-center gap-3 text-xs text-gray-400">
+                {elapsedTime !== null && (
+                  <span className="inline-flex items-center gap-1">
+                    <Clock className="w-3 h-3" />
+                    {formatDuration(elapsedTime)}
+                  </span>
+                )}
+                <span>{formatDate(task.createdAt)}</span>
+              </div>
             </div>
-            <span className="text-xs text-gray-400">
-              {formatDate(task.createdAt)}
-            </span>
-          </div>
 
           <p className="text-sm text-gray-500 mb-3">
             {task.files.length} 个文件
@@ -255,6 +291,14 @@ export const TaskPanel: React.FC = () => {
     return task.status === filter;
   });
 
+  const statusCounts = tasks.reduce((acc, task) => {
+    acc[task.status] = (acc[task.status] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+
+  const completedCount = statusCounts.completed || 0;
+  const hasCompletedTasks = completedCount > 0;
+
   const filters: { key: 'all' | Task['status']; label: string }[] = [
     { key: 'all', label: '全部' },
     { key: 'processing', label: '处理中' },
@@ -262,6 +306,17 @@ export const TaskPanel: React.FC = () => {
     { key: 'completed', label: '已完成' },
     { key: 'failed', label: '失败' },
   ];
+
+  const getFilterCount = (key: 'all' | Task['status']): number => {
+    if (key === 'all') return tasks.length;
+    return statusCounts[key] || 0;
+  };
+
+  const handleDownloadAll = () => {
+    if (!hasCompletedTasks) return;
+    const url = downloadApi.getAllCompletedDownloadUrl();
+    window.open(url, '_blank');
+  };
 
   return (
     <div className="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden">
@@ -271,28 +326,54 @@ export const TaskPanel: React.FC = () => {
             <h2 className="text-lg font-semibold text-gray-800">任务列表</h2>
             <p className="text-sm text-gray-500 mt-1">共 {tasks.length} 个任务</p>
           </div>
-          <button
-            onClick={() => void fetchTasks()}
-            className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
-          >
-            <RefreshCw className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleDownloadAll}
+              disabled={!hasCompletedTasks}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+                hasCompletedTasks
+                  ? 'text-white bg-blue-500 hover:bg-blue-600'
+                  : 'text-gray-400 bg-gray-100 cursor-not-allowed'
+              }`}
+            >
+              <Archive className="w-4 h-4" />
+              打包下载全部结果
+            </button>
+            <button
+              onClick={() => void fetchTasks()}
+              className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+            >
+              <RefreshCw className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         <div className="flex items-center gap-2 mt-4 flex-wrap">
-          {filters.map((f) => (
-            <button
-              key={f.key}
-              onClick={() => setFilter(f.key)}
-              className={`px-3 py-1.5 text-sm rounded-lg transition-colors ${
-                filter === f.key
-                  ? 'bg-blue-500 text-white'
-                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-              }`}
-            >
-              {f.label}
-            </button>
-          ))}
+          {filters.map((f) => {
+            const count = getFilterCount(f.key);
+            return (
+              <button
+                key={f.key}
+                onClick={() => setFilter(f.key)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+                  filter === f.key
+                    ? 'bg-blue-500 text-white'
+                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                }`}
+              >
+                {f.label}
+                <span
+                  className={`inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full text-xs font-medium ${
+                    filter === f.key
+                      ? 'bg-white/20 text-white'
+                      : 'bg-gray-200 text-gray-600'
+                  }`}
+                >
+                  {count}
+                </span>
+              </button>
+            );
+          })}
         </div>
       </div>
 
